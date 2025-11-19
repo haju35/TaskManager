@@ -1,89 +1,167 @@
 package data
 
 import (
+    "context"
     "errors"
-    "sync"
+    "time"
 
-    "github.com/google/uuid"
     "Task_manager/models"
+    "go.mongodb.org/mongo-driver/bson"
+    "go.mongodb.org/mongo-driver/bson/primitive"
+    "go.mongodb.org/mongo-driver/mongo"
+    "go.mongodb.org/mongo-driver/mongo/options"
 )
 
 var (
-    tasks []models.Task
-    mu    sync.RWMutex
+    TasksCollection *mongo.Collection
+    mongoClient     *mongo.Client
 )
 
-// GetAll returns all tasks.
-func GetAll() []models.Task {
-    mu.RLock()
-    defer mu.RUnlock()
-    out := make([]models.Task, len(tasks))
-    copy(out, tasks)
-    return out
+// ---------------------------
+// MongoDB Initialization
+// ---------------------------
+
+func InitMongo(uri, dbName, collectionName string) error {
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+
+    clientOpts := options.Client().ApplyURI(uri)
+
+    client, err := mongo.Connect(ctx, clientOpts)
+    if err != nil {
+        return err
+    }
+
+    if err := client.Ping(ctx, nil); err != nil {
+        return err
+    }
+
+    mongoClient = client
+    TasksCollection = client.Database(dbName).Collection(collectionName)
+    return nil
 }
 
-// GetByID returns a task by ID.
+// GetAll returns all tasks from MongoDB.
+func GetAll() ([]models.Task, error) {
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+
+    cursor, err := TasksCollection.Find(ctx, bson.M{})
+    if err != nil {
+        return nil, err
+    }
+    defer cursor.Close(ctx)
+
+    var results []models.Task
+    if err := cursor.All(ctx, &results); err != nil {
+        return nil, err
+    }
+
+    return results, nil
+}
+
+// GetByID returns one task by ID.
 func GetByID(id string) (*models.Task, error) {
-    mu.RLock()
-    defer mu.RUnlock()
-
-    for _, t := range tasks {
-        if t.ID == id {
-            copy := t
-            return &copy, nil
-        }
+    oid, err := primitive.ObjectIDFromHex(id)
+    if err != nil {
+        return nil, errors.New("invalid id")
     }
-    return nil, errors.New("not found")
+
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    var task models.Task
+    err = TasksCollection.FindOne(ctx, bson.M{"_id": oid}).Decode(&task)
+    if err != nil {
+        if err == mongo.ErrNoDocuments {
+            return nil, errors.New("not found")
+        }
+        return nil, err
+    }
+
+    return &task, nil
 }
 
-// Create adds a new task.
-func Create(t models.Task) models.Task {
-    mu.Lock()
-    defer mu.Unlock()
+// Create inserts a new task.
+func Create(t models.Task) (*models.Task, error) {
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
 
+    // assign ID if missing (for backward compatibility)
     if t.ID == "" {
-        t.ID = uuid.New().String()   // <-- requires github.com/google/uuid
+        t.ID = primitive.NewObjectID()
     }
 
-    tasks = append(tasks, t)
-    return t
+    _, err := TasksCollection.InsertOne(ctx, t)
+    if err != nil {
+        return nil, err
+    }
+
+    return &t, nil
 }
 
-// Update modifies a task.
+// Update modifies an existing task.
 func Update(id string, updated models.Task) error {
-    mu.Lock()
-    defer mu.Unlock()
-
-    for i := range tasks {
-        if tasks[i].ID == id {
-            if updated.Title != "" {
-                tasks[i].Title = updated.Title
-            }
-            if updated.Description != "" {
-                tasks[i].Description = updated.Description
-            }
-            if updated.DueDate != "" {
-                tasks[i].DueDate = updated.DueDate
-            }
-            if updated.Status != "" {
-                tasks[i].Status = updated.Status
-            }
-            return nil
-        }
+    oid, err := primitive.ObjectIDFromHex(id)
+    if err != nil {
+        return errors.New("invalid id")
     }
-    return errors.New("not found")
+
+    updateFields := bson.M{}
+    if updated.Title != "" {
+        updateFields["title"] = updated.Title
+    }
+    if updated.Description != "" {
+        updateFields["description"] = updated.Description
+    }
+    if updated.DueDate != "" {
+        updateFields["dueDate"] = updated.DueDate
+    }
+    if updated.Status != "" {
+        updateFields["status"] = updated.Status
+    }
+
+    if len(updateFields) == 0 {
+        return errors.New("no fields to update")
+    }
+
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    res, err := TasksCollection.UpdateOne(
+        ctx,
+        bson.M{"_id": oid},
+        bson.M{"$set": updateFields},
+    )
+    if err != nil {
+        return err
+    }
+
+    if res.MatchedCount == 0 {
+        return errors.New("not found")
+    }
+
+    return nil
 }
 
-// Delete removes a task.
+// Delete removes a task by ID.
 func Delete(id string) error {
-    mu.Lock()
-    defer mu.Unlock()
-
-    for i := range tasks {
-        if tasks[i].ID == id {
-            tasks = append(tasks[:i], tasks[i+1:]...)
-            return nil
-        }
+    oid, err := primitive.ObjectIDFromHex(id)
+    if err != nil {
+        return errors.New("invalid id")
     }
-    return errors.New("not found")
+
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    res, err := TasksCollection.DeleteOne(ctx, bson.M{"_id": oid})
+    if err != nil {
+        return err
+    }
+
+    if res.DeletedCount == 0 {
+        return errors.New("not found")
+    }
+
+    return nil
 }
